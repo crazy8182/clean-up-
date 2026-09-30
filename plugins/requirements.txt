@@ -1,0 +1,7 @@
+pyrofork==2.3.69
+tgcrypto-pyrofork
+motor==3.7.1
+pymongo==4.13.2
+aiohttp
+python-dotenv==0.21.1
+dnspython==2.7.0
