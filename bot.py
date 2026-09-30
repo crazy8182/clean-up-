@@ -4,6 +4,10 @@ import re
 import asyncio
 import logging
 from collections import defaultdict
+from dotenv import load_dotenv
+
+# Load .env when running from GitHub/Buildpack/local. Koyeb environment variables still take precedence.
+load_dotenv()
 
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -242,6 +246,11 @@ async def start_health_server():
     log.info("Health server listening on 0.0.0.0:%s", port)
 
 @app.on_message(filters.command("start") & filters.private)
+@app.on_message(filters.command("ping"))
+async def ping_cmd(client, message):
+    await message.reply_text("🏓 Bot is working!\n\nTelegram connection: ✅\nKoyeb service: ✅")
+
+@app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
@@ -474,6 +483,23 @@ async def confirm_delete_cmd(client, message):
 async def main():
     await start_health_server()
     await app.start()
+
+    me = await app.get_me()
+    log.info("====================================")
+    log.info("BOT CONNECTED")
+    log.info("Bot ID: %s", me.id)
+    log.info("Bot Username: @%s", me.username)
+    log.info("Bot Name: %s", me.first_name)
+    log.info("Admin IDs loaded: %s", sorted(ADMIN_IDS))
+    log.info("Channel ID: %s", CHANNEL_ID)
+
+    try:
+        await mongo.admin.command("ping")
+        log.info("MongoDB connection: OK")
+    except Exception as e:
+        log.exception("MongoDB connection test failed: %s", e)
+
+    log.info("====================================")
     log.info("Bot started")
     await asyncio.Event().wait()
 

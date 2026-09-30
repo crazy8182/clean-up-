@@ -81,3 +81,12 @@ Recommended HTTP health check:
 - Path: /health
 
 The bot must be admin in the channel with permission to delete messages.
+
+
+## Koyeb/.env fix
+
+The bot calls `load_dotenv()` before reading configuration, so a `.env` file present in the application directory can be loaded. Koyeb service environment variables also work and take precedence.
+
+On startup the logs show the connected Telegram bot username without exposing the token. Test `/ping` to verify Telegram updates.
+
+Do not publish real Telegram/MongoDB secrets in a public GitHub repository. Prefer Koyeb environment variables; if a secret has already been exposed publicly, rotate it.
