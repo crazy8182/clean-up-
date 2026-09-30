@@ -1,8 +1,10 @@
-FROM python:3.11-slim
+FROM python:3.12.2
+
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
-CMD ["python", "bot.py"]
+RUN pip install --no-cache-dir --upgrade pip --root-user-action=ignore &&     pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+
+COPY . .
+
+CMD ["python3", "bot.py"]

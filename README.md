@@ -1,41 +1,74 @@
-# Movie Cleanup Bot - Final
+# Movie Cleanup Bot - DreamX Reference Build
+
+Standalone cleanup/indexing bot built with the same Pyrofork stack used by the supplied Auto Filter reference.
+
+## Required environment variables
+
+API_ID
+API_HASH
+BOT_TOKEN
+MONGO_URI
+CHANNEL_ID
+ADMIN_IDS
+
+Optional:
+DB_NAME=movie_cleanup
+COLLECTION_NAME=files
+PORT=8080
+
+`ADMIN_IDS` accepts space or comma separated Telegram user IDs.
 
 ## Commands
 
+/start
+/ping
 /index
-/delete Movie or Series Name
-/confirm_delete Movie or Series Name
+/delete Movie Name
+/confirm_delete Movie Name
 /deleteall
 /confirm_deleteall
 
-## DELETEALL rules
+## Indexing
+
+`/index` scans the configured channel history and stores:
+- Telegram message_id
+- file_id
+- file_name
+- movie_name
+- quality
+- source
+- Telegram media_type
+- mime_type
+- file_size
+
+Telegram `document` and `video` are intentionally stored with different media_type values.
+
+## Cleanup rules
 
 ### Documents
-All non-video/document media indexed in MongoDB is deleted.
+Anything indexed as Telegram `document` is deleted by cleanup, even if the filename ends in `.mkv` or `.mp4`.
 
 ### Movies
-For recognized movie video files:
-- keep one 480p
-- keep one 720p
-- keep one 1080p
-- source priority: WEB-DL > WEBRip > HDRip
-- CAM/CAMRip/HDTC/HDTS/HDCAM/TS/TC are deleted
+Maximum one video for each:
+- 480p
+- 720p
+- 1080p
 
-### TV series individual episodes
-For each `SxxExx`:
-- keep one best 480p
-- keep one best 720p
-- keep one best 1080p
+At the same quality:
+WEB-DL > WEBRip > HDRip
 
-Example:
-Money Heist S01E01 480p WEB-DL -> KEEP
-Money Heist S01E01 720p WEB-DL -> KEEP
-Money Heist S01E01 1080p WEB-DL -> KEEP
+CAM/CAMRip/HDTC/HDTS/HDCAM/TS/TC are deleted.
 
-Duplicate source at same quality is removed according to source priority.
+### TV episodes
+For every S01E01-style episode:
+- one 480p
+- one 720p
+- one 1080p
 
-### Combined / complete / batch files
-The following are protected from episode-level duplicate logic:
+are retained.
+
+### Combined / Complete files
+These are protected:
 - Combined
 - Complete
 - Completed
@@ -48,49 +81,25 @@ The following are protected from episode-level duplicate logic:
 - All Episodes
 - Entire Season
 - Collection
-- episode ranges such as S01E01-E05
+- S01E01-E05 style ranges
 
-For these, one best file per quality is kept.
+For protected combined/season files, one best file per quality is retained.
 
-## SAFETY
+### Safety
+Unknown/non-standard video files are kept conservatively.
 
-/deleteall is a two-step process.
-
-1. /deleteall only scans and creates a preview.
-2. /confirm_deleteall performs deletion.
-
-For every file:
+For every deletion:
 1. Telegram message is deleted first.
 2. MongoDB record is deleted only after Telegram deletion succeeds.
-3. If Telegram deletion fails, MongoDB record remains.
-
-Unknown/non-standard video names are conservatively kept instead of being automatically deleted.
+3. If Telegram deletion fails, its MongoDB record remains.
 
 ## Koyeb
 
 Use Web Service.
+HTTP health check:
+- Path: `/health`
+- Port: 8080 (or Koyeb `$PORT`)
 
-Health endpoint:
-`/health`
+The process binds to `0.0.0.0:$PORT`.
 
-The application listens on:
-`0.0.0.0:$PORT`
-
-Recommended HTTP health check:
-- Port: 8080 (or the Koyeb exposed PORT)
-- Path: /health
-
-The bot must be admin in the channel with permission to delete messages.
-
-
-## Koyeb/.env fix
-
-The bot calls `load_dotenv()` before reading configuration, so a `.env` file present in the application directory can be loaded. Koyeb service environment variables also work and take precedence.
-
-On startup the logs show the connected Telegram bot username without exposing the token. Test `/ping` to verify Telegram updates.
-
-Do not publish real Telegram/MongoDB secrets in a public GitHub repository. Prefer Koyeb environment variables; if a secret has already been exposed publicly, rotate it.
-
-
-## v4 Telegram command fix
-Commands are handled by a single private-text router with explicit logging. This avoids duplicate command-filter handlers and accepts `/start`, `/ping`, `/index`, `/delete`, `/deleteall` and confirmation commands including `/command@botusername` forms.
+The bot uses Pyrofork 2.3.69, matching the supplied reference project stack.

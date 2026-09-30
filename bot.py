@@ -4,55 +4,110 @@ import re
 import asyncio
 import logging
 from collections import defaultdict
-from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-# Load .env when running from GitHub/Buildpack/local. Koyeb environment variables still take precedence.
+from dotenv import load_dotenv
 load_dotenv()
 
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pymongo import ASCENDING
+from pyrogram import Client, filters, idle, enums
+from pyrogram.errors import FloodWait, RPCError
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("movie-cleanup")
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-MONGO_URI = os.environ["MONGO_URI"]
-DB_NAME = os.getenv("DB_NAME", "movie_cleanup")
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])
-ADMIN_IDS = {int(x.strip()) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()}
+# ============================================================
+# ENV
+# ============================================================
+def env_int(name, default=None):
+    value = os.getenv(name)
+    if value is None or value == "":
+        if default is None:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return default
+    return int(value)
 
-app = Client("movie_cleanup_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-mongo = AsyncIOMotorClient(MONGO_URI)
+API_ID = env_int("API_ID")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", os.getenv("DATABASE_URI", "")).strip()
+DB_NAME = os.getenv("DB_NAME", os.getenv("DATABASE_NAME", "movie_cleanup")).strip()
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "files").strip()
+CHANNEL_ID = env_int("CHANNEL_ID")
+PORT = env_int("PORT", 8080)
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", os.getenv("ADMINS", "")).replace(",", " ").split()
+    if x.strip()
+}
+
+if not API_HASH:
+    raise RuntimeError("Missing API_HASH")
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN")
+if not MONGO_URI:
+    raise RuntimeError("Missing MONGO_URI or DATABASE_URI")
+if not ADMIN_IDS:
+    raise RuntimeError("Missing ADMIN_IDS")
+
+# ============================================================
+# TELEGRAM + MONGODB
+# ============================================================
+app = Client(
+    "movie_cleanup_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=8,
+    sleep_threshold=5,
+)
+
+mongo = AsyncIOMotorClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=15000,
+    connectTimeoutMS=15000,
+    socketTimeoutMS=30000,
+)
 db = mongo[DB_NAME]
-files_col = db["files"]
+files = db[COLLECTION_NAME]
 
-# Only these three quality labels are eligible for normal retention.
-KEEP_QUALITIES = {"480p", "720p", "1080p"}
+# ============================================================
+# QUALITY / SOURCE RULES
+# ============================================================
+QUALITIES = {"480p", "720p", "1080p"}
+QUALITY_RANK = {"1080p": 3, "720p": 2, "480p": 1}
 
-# Same-quality source priority: lower number wins.
-SOURCE_PRIORITY = {"WEB-DL": 1, "WEBRip": 2, "HDRip": 3}
+SOURCE_RANK = {
+    "WEB-DL": 1,
+    "WEBRip": 2,
+    "HDRip": 3,
+}
 
 BAD_SOURCES = {
-    "CAM", "CAMRIP", "HDCAM", "HDTC", "HDTS", "TS", "TC",
-    "TELECINE", "TELESYNC"
+    "CAM", "CAMRIP", "HDCAM", "HDTC", "HDTS",
+    "TS", "TC", "TELECINE", "TELESYNC",
 }
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm",
-    ".ts", ".m2ts", ".wmv", ".flv", ".mpeg", ".mpg"
+    ".ts", ".m2ts", ".wmv", ".flv", ".mpeg", ".mpg",
 }
 
-# These indicate a season/collection/multi-episode file.
 COMBINED_PATTERNS = [
     r"\bcomplete\b",
     r"\bcompleted\b",
     r"\bcombined\b",
-    r"\bcomplete[ ._-]*season\b",
     r"\bfull[ ._-]*season\b",
+    r"\bcomplete[ ._-]*season\b",
     r"\bseason[ ._-]*pack\b",
     r"\bseason[ ._-]*batch\b",
     r"\bbatch\b",
@@ -63,44 +118,43 @@ COMBINED_PATTERNS = [
     r"\bcomplete[ ._-]*collection\b",
 ]
 
-# A range such as S01E01-E05 is also a combined/multi-episode file.
+EPISODE_RE = re.compile(r"\bS(\d{1,2})\s*E(\d{1,3})\b", re.I)
+SEASON_RE = re.compile(r"\bS(\d{1,2})\b|\bSEASON\s*(\d{1,2})\b", re.I)
+
 EPISODE_RANGE_PATTERNS = [
     r"\bS\d{1,2}E\d{1,3}\s*[-_–]\s*(?:E)?\d{1,3}\b",
     r"\bE\d{1,3}\s*[-_–]\s*(?:E)?\d{1,3}\b",
-    r"\b\d{1,3}\s*[-_–]\s*\d{1,3}\b",
 ]
 
-EPISODE_PATTERN = re.compile(r"\bS(\d{1,2})\s*E(\d{1,3})\b", re.I)
-SEASON_PATTERN = re.compile(r"\bS(\d{1,2})\b|\bSEASON\s*(\d{1,2})\b", re.I)
-
-def extension(name):
-    return os.path.splitext((name or "").lower())[1]
-
-def is_video(doc):
-    if doc.get("media_type") == "video":
-        return True
-    return extension(doc.get("file_name", "")) in VIDEO_EXTENSIONS
-
-def is_document(doc):
-    return not is_video(doc)
-
-def normalize_name(name):
+# ============================================================
+# HELPERS
+# ============================================================
+def normalize_name(name: str) -> str:
     s = (name or "").lower()
     s = re.sub(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}", " ", s)
     s = re.sub(r"[\._\-]+", " ", s)
-    s = re.sub(r"\b(480p|720p|1080p|2160p|4k|8k)\b", " ", s, flags=re.I)
+    s = re.sub(
+        r"\b(480p|720p|1080p|2160p|4k|8k)\b",
+        " ",
+        s,
+        flags=re.I,
+    )
     s = re.sub(
         r"\b(web[ -]?dl|web[ -]?rip|hdrip|camrip|cam|hdtc|hdts|hdcam|ts|tc)\b",
-        " ", s, flags=re.I
+        " ",
+        s,
+        flags=re.I,
     )
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def detect_quality(name):
+
+def detect_quality(name: str) -> str:
     m = re.search(r"\b(480p|720p|1080p|2160p|4k)\b", name or "", re.I)
     return m.group(1).lower() if m else "unknown"
 
-def detect_source(name):
+
+def detect_source(name: str) -> str:
     n = (name or "").upper().replace("_", " ")
     checks = [
         ("WEB-DL", r"\bWEB[ ._-]?DL\b"),
@@ -119,421 +173,583 @@ def detect_source(name):
             return label
     return "unknown"
 
-def is_bad_source(doc):
-    return str(doc.get("source", "unknown")).upper() in BAD_SOURCES
 
-def combined_type(name):
+def combined_type(name: str) -> bool:
     n = (name or "").lower().replace("_", " ").replace("-", " ")
-    for p in COMBINED_PATTERNS:
-        if re.search(p, n, re.I):
-            return True
-    for p in EPISODE_RANGE_PATTERNS:
-        if re.search(p, n, re.I):
+    for pattern in COMBINED_PATTERNS + EPISODE_RANGE_PATTERNS:
+        if re.search(pattern, n, re.I):
             return True
     return False
 
-def episode_info(name):
-    m = EPISODE_PATTERN.search(name or "")
+
+def episode_info(name: str):
+    m = EPISODE_RE.search(name or "")
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
 
-def season_info(name):
-    m = SEASON_PATTERN.search(name or "")
+
+def season_info(name: str):
+    m = SEASON_RE.search(name or "")
     if not m:
         return None
     return int(m.group(1) or m.group(2))
 
-def source_rank(doc):
-    return SOURCE_PRIORITY.get(doc.get("source"), 99)
 
-def choose_best(docs):
-    """Choose one best file from a group, based on source priority."""
-    return sorted(
-        docs,
-        key=lambda d: (
-            source_rank(d),
-            -int(d.get("file_size") or 0),
-            int(d.get("message_id") or 0)
-        )
-    )[0]
-
-def series_key(doc):
-    # Prefer normalized name; remove episode and combined labels to group a series.
-    n = normalize_name(doc.get("file_name", ""))
+def series_key(name: str) -> str:
+    n = normalize_name(name)
     n = re.sub(r"\bS\d{1,2}E\d{1,3}\b", " ", n, flags=re.I)
     n = re.sub(r"\bSEASON\s*\d{1,2}\b", " ", n, flags=re.I)
     n = re.sub(r"\bS\d{1,2}\b", " ", n, flags=re.I)
-    n = re.sub(r"\b(complete|completed|combined|full season|season pack|season batch|batch|multi episode|all episodes|entire season|collection)\b", " ", n, flags=re.I)
+    n = re.sub(
+        r"\b(complete|completed|combined|full season|complete season|"
+        r"season pack|season batch|batch|multi episode|all episodes|"
+        r"entire season|collection)\b",
+        " ",
+        n,
+        flags=re.I,
+    )
     return re.sub(r"\s+", " ", n).strip()
 
-def plan_deleteall(docs):
-    """
-    Global cleanup rules:
 
-    1. Documents: DELETE.
-    2. Bad-source videos: DELETE.
-    3. TV individual episodes:
-       - keep one best 480p, one best 720p, one best 1080p per episode.
-    4. TV combined/complete/multi-episode files:
-       - preserve one best file per quality.
-    5. Movies:
-       - keep one best 480p, one best 720p, one best 1080p.
-    6. Unknown/unclassifiable videos are conservatively kept.
+def is_bad_source(doc) -> bool:
+    return str(doc.get("source", "unknown")).upper() in BAD_SOURCES
+
+
+def is_video_record(doc) -> bool:
+    # IMPORTANT: media_type is the Telegram media type at indexing time.
+    # A .mkv uploaded as a Telegram DOCUMENT is still a document and will
+    # be deleted by /deleteall.
+    return doc.get("media_type") == "video"
+
+
+def source_rank(doc) -> int:
+    return SOURCE_RANK.get(doc.get("source"), 99)
+
+
+def choose_best(items):
+    return sorted(
+        items,
+        key=lambda d: (
+            source_rank(d),
+            -int(d.get("file_size") or 0),
+            int(d.get("message_id") or 0),
+        ),
+    )[0]
+
+
+# ============================================================
+# CLEANUP PLANNER
+# ============================================================
+def build_cleanup_plan(all_docs):
     """
+    Returns keep_docs, delete_docs.
+
+    Documents:
+      ALWAYS DELETE.
+
+    Bad source videos:
+      ALWAYS DELETE.
+
+    TV individual episodes:
+      Keep max one 480p, one 720p, one 1080p.
+      Same quality source priority: WEB-DL > WEBRip > HDRip.
+
+    Combined / complete / batch / multi-episode:
+      Keep max one per quality.
+
+    Movies:
+      Keep max one 480p, one 720p, one 1080p.
+
+    Unknown/non-standard video:
+      KEEP conservatively.
+    """
+    delete_ids = set()
     keep_ids = set()
     groups = defaultdict(list)
 
-    # Documents and clearly bad sources can be decided immediately.
-    delete_ids = set()
-    for d in docs:
-        if is_document(d):
-            delete_ids.add(d["_id"])
-        elif is_bad_source(d):
-            delete_ids.add(d["_id"])
+    for doc in all_docs:
+        if not is_video_record(doc):
+            delete_ids.add(doc["_id"])
+        elif is_bad_source(doc):
+            delete_ids.add(doc["_id"])
 
-    candidates = [
-        d for d in docs
+    eligible = [
+        d for d in all_docs
         if d["_id"] not in delete_ids
-        and is_video(d)
-        and d.get("quality") in KEEP_QUALITIES
-        and d.get("source") in SOURCE_PRIORITY
+        and is_video_record(d)
+        and d.get("quality") in QUALITIES
+        and d.get("source") in SOURCE_RANK
     ]
 
-    # Group likely TV episode files.
-    for d in candidates:
-        ep = episode_info(d.get("file_name", ""))
-        season = season_info(d.get("file_name", ""))
+    for doc in eligible:
+        name = doc.get("file_name", "")
+        ep = episode_info(name)
+        season = season_info(name)
+
         if ep and season:
-            key = ("episode", series_key(d), ep[0], ep[1], d["quality"])
-            groups[key].append(d)
-        elif season and combined_type(d.get("file_name", "")):
-            key = ("combined", series_key(d), season, d["quality"])
-            groups[key].append(d)
+            # Individual episode: series + season + episode + quality.
+            key = (
+                "episode",
+                series_key(name),
+                season,
+                ep[1],
+                doc["quality"],
+            )
+        elif season and combined_type(name):
+            # Combined/complete season: series + season + quality.
+            key = (
+                "combined",
+                series_key(name),
+                season,
+                doc["quality"],
+            )
         else:
-            key = ("movie", normalize_name(d.get("file_name", "")), d["quality"])
-            groups[key].append(d)
+            # Movie or non-season file: normalized title + quality.
+            key = (
+                "movie",
+                normalize_name(name),
+                doc["quality"],
+            )
 
-    for key, items in groups.items():
-        best = choose_best(items)
-        keep_ids.add(best["_id"])
+        groups[key].append(doc)
 
-    # Unknown video files are kept for safety, rather than silently deleting them.
-    for d in docs:
-        if d["_id"] not in delete_ids and d["_id"] not in keep_ids:
-            if is_video(d):
-                # It may be a non-standard filename or unsupported quality.
-                # Keep it conservatively.
-                if d.get("quality") not in KEEP_QUALITIES or d.get("source") not in SOURCE_PRIORITY:
-                    keep_ids.add(d["_id"])
+    for items in groups.values():
+        keep_ids.add(choose_best(items)["_id"])
 
-    delete_docs = [d for d in docs if d["_id"] not in keep_ids]
-    keep_docs = [d for d in docs if d["_id"] in keep_ids]
+    # Safety: unknown quality/source videos are NOT automatically deleted.
+    for doc in all_docs:
+        if (
+            doc["_id"] not in delete_ids
+            and doc["_id"] not in keep_ids
+            and is_video_record(doc)
+        ):
+            keep_ids.add(doc["_id"])
+
+    keep_docs = [d for d in all_docs if d["_id"] in keep_ids]
+    delete_docs = [d for d in all_docs if d["_id"] not in keep_ids]
+
     return keep_docs, delete_docs
 
-async def health(request):
+
+# ============================================================
+# HEALTH SERVER
+# ============================================================
+async def health_handler(request):
     return web.Response(text="OK")
 
+
 async def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
     server = web.Application()
-    server.router.add_get("/", health)
-    server.router.add_get("/health", health)
+    server.router.add_get("/", health_handler)
+    server.router.add_get("/health", health_handler)
+
     runner = web.AppRunner(server)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Health server listening on 0.0.0.0:%s", port)
 
-@app.on_message(filters.private & filters.text)
-async def command_router(client, message):
-    """Robust private command router with explicit logging."""
-    text = (message.text or "").strip()
-    if not text:
-        return
+    log.info("Health server listening on 0.0.0.0:%s", PORT)
 
-    user_id = message.from_user.id if message.from_user else None
-    log.info(
-        "Incoming private message: user_id=%s username=%s text=%r",
-        user_id,
-        message.from_user.username if message.from_user else None,
-        text[:200],
-    )
 
-    parts = text.split(maxsplit=1)
-    command = parts[0].split("@", 1)[0].lower()
-    args = parts[1] if len(parts) > 1 else ""
+# ============================================================
+# INDEX
+# ============================================================
+async def index_channel(message):
+    status = await message.reply_text("⏳ Starting channel indexing...")
 
-    if command == "/ping":
-        await message.reply_text(
-            "🏓 Bot is working!\\n\\n"
-            "Telegram connection: ✅\\n"
-            "Koyeb service: ✅"
-        )
-        return
+    scanned = 0
+    saved = 0
+    updated = 0
+    skipped = 0
+    last_report = 0
 
-    if command == "/start":
-        if user_id not in ADMIN_IDS:
-            await message.reply_text(
-                f"⛔ Admin only.\\nYour Telegram ID: `{user_id}`"
-            )
-            return
-        await message.reply_text(
-            "🎬 Movie Cleanup Bot\\n\\n"
-            "/ping - connection test\\n"
-            "/index - index channel\\n"
-            "/delete Movie/Series - preview one title\\n"
-            "/confirm_delete Movie/Series - execute one-title cleanup\\n"
-            "/deleteall - scan complete database and preview cleanup\\n"
-            "/confirm_deleteall - execute complete cleanup"
-        )
-        return
-
-    # Dispatch to the existing functions. They are defined before the first
-    # Telegram update can normally arrive because app.start() is called in main.
-    if command == "/index":
-        return await index_cmd(client, message)
-    if command == "/delete":
-        return await delete_cmd(client, message)
-    if command == "/confirm_delete":
-        return await confirm_delete_cmd(client, message)
-    if command == "/deleteall":
-        return await deleteall_cmd(client, message)
-    if command == "/confirm_deleteall":
-        return await confirm_deleteall_cmd(client, message)
-
-async def index_cmd(client, message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("⛔ Admin only.")
-    status = await message.reply_text("⏳ Indexing channel files...")
-    count = 0
-
-    async for msg in client.get_chat_history(CHANNEL_ID):
-        media = msg.document or msg.video or msg.audio
-        if not media:
-            continue
-
-        name = getattr(media, "file_name", None) or f"message_{msg.id}"
-        media_type = "video" if msg.video else ("document" if msg.document else "audio")
-
-        doc = {
-            "channel_id": CHANNEL_ID,
-            "message_id": msg.id,
-            "file_id": media.file_id,
-            "file_name": name,
-            "movie_name": normalize_name(name),
-            "quality": detect_quality(name),
-            "source": detect_source(name),
-            "media_type": media_type,
-            "file_size": getattr(media, "file_size", 0) or 0,
-        }
-
-        await files_col.update_one(
-            {"channel_id": CHANNEL_ID, "message_id": msg.id},
-            {"$set": doc},
-            upsert=True
-        )
-        count += 1
-
-        if count % 100 == 0:
-            await status.edit_text(f"⏳ Indexed: {count}")
-
-    await status.edit_text(f"✅ Index complete.\nFiles indexed: {count}")
-
-async def delete_telegram_then_mongo(client, doc):
     try:
-        await client.delete_messages(CHANNEL_ID, int(doc["message_id"]))
+        async for msg in app.get_chat_history(CHANNEL_ID):
+            scanned += 1
+
+            media = None
+            media_type = None
+
+            if msg.video:
+                media = msg.video
+                media_type = "video"
+            elif msg.document:
+                media = msg.document
+                media_type = "document"
+            elif msg.audio:
+                media = msg.audio
+                media_type = "audio"
+
+            if media is None:
+                continue
+
+            file_name = getattr(media, "file_name", None) or f"message_{msg.id}"
+            quality = detect_quality(file_name)
+            source = detect_source(file_name)
+
+            record = {
+                "channel_id": CHANNEL_ID,
+                "message_id": msg.id,
+                "file_id": media.file_id,
+                "file_name": file_name,
+                "movie_name": normalize_name(file_name),
+                "quality": quality,
+                "source": source,
+                "media_type": media_type,
+                "mime_type": getattr(media, "mime_type", None),
+                "file_size": int(getattr(media, "file_size", 0) or 0),
+                "indexed_at": datetime.now(timezone.utc),
+            }
+
+            result = await files.update_one(
+                {
+                    "channel_id": CHANNEL_ID,
+                    "message_id": msg.id,
+                },
+                {"$set": record},
+                upsert=True,
+            )
+
+            if result.upserted_id is not None:
+                saved += 1
+            else:
+                updated += 1
+
+            if scanned - last_report >= 100:
+                last_report = scanned
+                await status.edit_text(
+                    f"⏳ Indexing...\n\n"
+                    f"Messages scanned: {scanned}\n"
+                    f"New files: {saved}\n"
+                    f"Updated: {updated}"
+                )
+
+        await status.edit_text(
+            f"✅ Indexing completed.\n\n"
+            f"Messages scanned: {scanned}\n"
+            f"New files: {saved}\n"
+            f"Updated: {updated}"
+        )
+
+    except Exception as e:
+        log.exception("Index error")
+        await status.edit_text(
+            f"❌ Indexing error:\n<code>{str(e)[:1500]}</code>"
+        )
+
+
+# ============================================================
+# DELETE EXECUTION
+# ============================================================
+async def delete_one(doc):
+    """
+    Telegram deletion MUST succeed before MongoDB record deletion.
+    """
+    message_id = int(doc["message_id"])
+
+    try:
+        await app.delete_messages(CHANNEL_ID, message_id)
     except FloodWait as e:
         await asyncio.sleep(e.value)
-        await client.delete_messages(CHANNEL_ID, int(doc["message_id"]))
+        await app.delete_messages(CHANNEL_ID, message_id)
 
     # Only after successful Telegram deletion:
-    await files_col.delete_one({
+    result = await files.delete_one({
         "channel_id": CHANNEL_ID,
-        "message_id": int(doc["message_id"])
+        "message_id": message_id,
     })
 
-async def run_deletion(client, docs, progress):
+    return result.deleted_count
+
+
+async def execute_deletion(docs, status):
     deleted = 0
     failed = 0
 
-    for d in docs:
-        try:
-            await delete_telegram_then_mongo(client, d)
-            deleted += 1
-        except Exception as e:
-            failed += 1
-            log.exception("Deletion failed message=%s: %s", d.get("message_id"), e)
+    total = len(docs)
 
-        processed = deleted + failed
-        if processed % 20 == 0 or processed == len(docs):
-            await progress.edit_text(
-                f"🗑 Progress: {processed}/{len(docs)}\n"
-                f"Telegram deleted: {deleted}\n"
-                f"MongoDB removed: {deleted}\n"
-                f"Failed: {failed}"
+    for index, doc in enumerate(docs, 1):
+        try:
+            removed = await delete_one(doc)
+            if removed:
+                deleted += 1
+        except RPCError as e:
+            failed += 1
+            log.error(
+                "Telegram delete failed message_id=%s: %s",
+                doc.get("message_id"),
+                e,
             )
+        except Exception:
+            failed += 1
+            log.exception(
+                "Delete failed message_id=%s",
+                doc.get("message_id"),
+            )
+
+        if index % 20 == 0 or index == total:
+            try:
+                await status.edit_text(
+                    f"🗑 Deletion progress\n\n"
+                    f"Processed: {index}/{total}\n"
+                    f"Telegram deleted: {deleted}\n"
+                    f"MongoDB removed: {deleted}\n"
+                    f"Failed: {failed}"
+                )
+            except Exception:
+                pass
 
     return deleted, failed
 
-async def deleteall_cmd(client, message):
+
+# ============================================================
+# COMMAND HANDLERS
+# ============================================================
+@app.on_message(filters.private & filters.command("start"))
+async def start_handler(client, message):
+    user_id = message.from_user.id
+
+    if user_id not in ADMIN_IDS:
+        return await message.reply_text(
+            f"⛔ Admin only.\n\nYour Telegram ID: <code>{user_id}</code>"
+        )
+
+    await message.reply_text(
+        "🎬 <b>Movie Cleanup Bot</b>\n\n"
+        "/ping - Bot test\n"
+        "/index - Index channel\n"
+        "/delete Movie Name - Preview one title\n"
+        "/confirm_delete Movie Name - Delete one title\n"
+        "/deleteall - Scan complete database\n"
+        "/confirm_deleteall - Execute complete cleanup",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.private & filters.command("ping"))
+async def ping_handler(client, message):
+    await message.reply_text(
+        "🏓 <b>Bot is working!</b>\n\n"
+        "Telegram: ✅\n"
+        "Koyeb: ✅\n"
+        f"Admin: {'✅' if message.from_user.id in ADMIN_IDS else '❌'}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.private & filters.command("index"))
+async def index_handler(client, message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("⛔ Admin only.")
+
+    await index_channel(message)
+
+
+@app.on_message(filters.private & filters.command("delete"))
+async def delete_handler(client, message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("⛔ Admin only.")
+
+    if len(message.command) < 2:
+        return await message.reply_text("Usage:\n/delete Movie Name")
+
+    query = normalize_name(" ".join(message.command[1:]))
+
+    docs = await files.find({
+        "channel_id": CHANNEL_ID,
+        "movie_name": {"$regex": re.escape(query), "$options": "i"},
+    }).to_list(length=10000)
+
+    if not docs:
+        return await message.reply_text("ℹ️ No indexed files found.")
+
+    keep, delete_docs = build_cleanup_plan(docs)
+
+    preview = "\n".join(
+        f"❌ {d.get('file_name', 'unknown')}"
+        for d in delete_docs[:30]
+    ) or "Nothing"
+
+    await message.reply_text(
+        f"🎬 <b>{' '.join(message.command[1:])}</b>\n\n"
+        f"Indexed: {len(docs)}\n"
+        f"Keep: {len(keep)}\n"
+        f"Delete: {len(delete_docs)}\n\n"
+        f"<b>Delete preview:</b>\n{preview}\n\n"
+        f"Run:\n<code>/confirm_delete {' '.join(message.command[1:])}</code>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.private & filters.command("confirm_delete"))
+async def confirm_delete_handler(client, message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.reply_text("⛔ Admin only.")
+
+    if len(message.command) < 2:
+        return await message.reply_text("Usage:\n/confirm_delete Movie Name")
+
+    query = normalize_name(" ".join(message.command[1:]))
+
+    docs = await files.find({
+        "channel_id": CHANNEL_ID,
+        "movie_name": {"$regex": re.escape(query), "$options": "i"},
+    }).to_list(length=10000)
+
+    if not docs:
+        return await message.reply_text("ℹ️ No indexed files found.")
+
+    keep, delete_docs = build_cleanup_plan(docs)
+
+    if not delete_docs:
+        return await message.reply_text("✅ Nothing to delete.")
+
+    status = await message.reply_text(
+        f"🗑 Starting deletion of {len(delete_docs)} files..."
+    )
+
+    deleted, failed = await execute_deletion(delete_docs, status)
+
+    await status.edit_text(
+        f"✅ <b>Cleanup completed</b>\n\n"
+        f"Telegram deleted: {deleted}\n"
+        f"MongoDB removed: {deleted}\n"
+        f"Failed: {failed}\n"
+        f"Kept: {len(keep)}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.private & filters.command("deleteall"))
+async def deleteall_handler(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
 
     status = await message.reply_text("🔎 Scanning complete MongoDB index...")
-    docs = await files_col.find({"channel_id": CHANNEL_ID}).to_list(length=100000)
+
+    docs = await files.find({"channel_id": CHANNEL_ID}).to_list(length=200000)
 
     if not docs:
-        return await status.edit_text("ℹ️ MongoDB index is empty. Run /index first.")
-
-    keep, delete_docs = plan_deleteall(docs)
-
-    document_count = sum(1 for d in docs if is_document(d))
-    bad_count = sum(1 for d in docs if is_video(d) and is_bad_source(d))
-
-    # Keep only a compact preview in Telegram.
-    sample = []
-    for d in delete_docs[:30]:
-        sample.append("❌ " + d.get("file_name", "unknown"))
-
-    text = (
-        "🔎 DELETEALL PREVIEW\n\n"
-        f"Total indexed: {len(docs)}\n"
-        f"Documents: {document_count}\n"
-        f"Bad-source videos: {bad_count}\n"
-        f"To delete: {len(delete_docs)}\n"
-        f"To keep: {len(keep)}\n\n"
-        "Series rule:\n"
-        "• 480p + 720p + 1080p per individual episode\n"
-        "• Combined/Complete/Completed/Full Season/Batch/Multi-Episode protected\n"
-        "• Movies: one best file per quality\n\n"
-        "Delete preview:\n"
-        + ("\n".join(sample) if sample else "Nothing")
-        + (
-            f"\n... +{len(delete_docs)-30} more" if len(delete_docs) > 30 else ""
+        return await status.edit_text(
+            "ℹ️ Database index is empty.\nRun /index first."
         )
-        + "\n\n⚠️ No files have been deleted yet.\n"
-          "Run /confirm_deleteall to execute."
-    )
-    await status.edit_text(text)
 
-async def confirm_deleteall_cmd(client, message):
+    keep, delete_docs = build_cleanup_plan(docs)
+
+    documents = sum(1 for d in docs if not is_video_record(d))
+    bad = sum(1 for d in docs if is_video_record(d) and is_bad_source(d))
+
+    preview = "\n".join(
+        f"❌ {d.get('file_name', 'unknown')}"
+        for d in delete_docs[:40]
+    ) or "Nothing"
+
+    await status.edit_text(
+        "🔎 <b>DELETEALL PREVIEW</b>\n\n"
+        f"Total indexed: {len(docs)}\n"
+        f"Documents: {documents}\n"
+        f"Bad-source videos: {bad}\n"
+        f"Delete: {len(delete_docs)}\n"
+        f"Keep: {len(keep)}\n\n"
+        "<b>Series rule</b>\n"
+        "• Each episode keeps 480p + 720p + 1080p\n"
+        "• Same quality: WEB-DL > WEBRip > HDRip\n"
+        "• Combined/Complete/Completed/Full Season/Batch/Multi-Episode protected\n"
+        "• Movies keep one best file per quality\n\n"
+        "<b>Delete preview</b>\n"
+        f"{preview}\n\n"
+        "⚠️ Nothing has been deleted yet.\n\n"
+        "Run <code>/confirm_deleteall</code> to execute.",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@app.on_message(filters.private & filters.command("confirm_deleteall"))
+async def confirm_deleteall_handler(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
 
-    status = await message.reply_text("🔎 Re-scanning MongoDB before deletion...")
-    docs = await files_col.find({"channel_id": CHANNEL_ID}).to_list(length=100000)
+    status = await message.reply_text(
+        "🔎 Re-scanning database before deletion..."
+    )
+
+    docs = await files.find({"channel_id": CHANNEL_ID}).to_list(length=200000)
 
     if not docs:
-        return await status.edit_text("ℹ️ Nothing indexed.")
+        return await status.edit_text("ℹ️ Database is empty.")
 
-    keep, delete_docs = plan_deleteall(docs)
+    keep, delete_docs = build_cleanup_plan(docs)
 
     if not delete_docs:
         return await status.edit_text("✅ Database is already clean.")
 
     await status.edit_text(
-        f"🗑 Starting DELETEALL\n"
-        f"Files to delete: {len(delete_docs)}\n"
-        f"Files to keep: {len(keep)}"
+        f"🗑 Starting cleanup...\n\n"
+        f"Delete: {len(delete_docs)}\n"
+        f"Keep: {len(keep)}"
     )
 
-    deleted, failed = await run_deletion(client, delete_docs, status)
+    deleted, failed = await execute_deletion(delete_docs, status)
 
     await status.edit_text(
-        f"✅ DELETEALL completed\n\n"
-        f"Telegram deleted: {deleted}\n"
-        f"MongoDB records removed: {deleted}\n"
-        f"Failed: {failed}\n\n"
-        f"Remaining indexed files: {len(keep) + failed}"
-    )
-
-async def delete_cmd(client, message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("⛔ Admin only.")
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply_text("Usage: /delete Movie Name")
-
-    query = normalize_name(parts[1])
-    docs = await files_col.find({
-        "channel_id": CHANNEL_ID,
-        "movie_name": {"$regex": re.escape(query), "$options": "i"}
-    }).to_list(length=5000)
-
-    if not docs:
-        return await message.reply_text("ℹ️ No indexed files found.")
-
-    keep, delete_docs = plan_deleteall(docs)
-
-    text = (
-        f"🎬 {parts[1]}\n\n"
-        f"Found: {len(docs)}\n"
-        f"Delete: {len(delete_docs)}\n"
-        f"Keep: {len(keep)}\n\n"
-        "⚠️ Preview only.\n"
-        f"Run /confirm_delete {parts[1]} to delete."
-    )
-    await message.reply_text(text)
-
-async def confirm_delete_cmd(client, message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("⛔ Admin only.")
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply_text("Usage: /confirm_delete Movie Name")
-
-    query = normalize_name(parts[1])
-    docs = await files_col.find({
-        "channel_id": CHANNEL_ID,
-        "movie_name": {"$regex": re.escape(query), "$options": "i"}
-    }).to_list(length=5000)
-
-    if not docs:
-        return await message.reply_text("ℹ️ No indexed files found.")
-
-    keep, delete_docs = plan_deleteall(docs)
-
-    if not delete_docs:
-        return await message.reply_text("✅ Nothing to delete.")
-
-    progress = await message.reply_text(
-        f"🗑 Starting cleanup: {len(delete_docs)} files"
-    )
-    deleted, failed = await run_deletion(client, delete_docs, progress)
-
-    await progress.edit_text(
-        f"✅ Cleanup completed\n\n"
+        f"✅ <b>DELETEALL completed</b>\n\n"
         f"Telegram deleted: {deleted}\n"
         f"MongoDB removed: {deleted}\n"
         f"Failed: {failed}\n"
-        f"Kept: {len(keep)}"
+        f"Remaining planned keep: {len(keep)}",
+        parse_mode=enums.ParseMode.HTML,
     )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+async def startup_checks():
+    await mongo.admin.command("ping")
+    await files.create_index(
+        [("channel_id", ASCENDING), ("message_id", ASCENDING)],
+        unique=True,
+    )
+    await files.create_index([("channel_id", ASCENDING), ("movie_name", ASCENDING)])
+    await app.get_chat(CHANNEL_ID)
+
 
 async def main():
     await start_health_server()
+
+    log.info("Starting Telegram client...")
     await app.start()
 
     me = await app.get_me()
-    log.info("====================================")
+
+    log.info("========================================")
     log.info("BOT CONNECTED")
     log.info("Bot ID: %s", me.id)
     log.info("Bot Username: @%s", me.username)
     log.info("Bot Name: %s", me.first_name)
-    log.info("Admin IDs loaded: %s", sorted(ADMIN_IDS))
+    log.info("Admin IDs: %s", sorted(ADMIN_IDS))
     log.info("Channel ID: %s", CHANNEL_ID)
 
     try:
-        await mongo.admin.command("ping")
-        log.info("MongoDB connection: OK")
-    except Exception as e:
-        log.exception("MongoDB connection test failed: %s", e)
+        await startup_checks()
+        log.info("MongoDB: OK")
+        log.info("Channel access: OK")
+        log.info("Indexes: OK")
+    except Exception:
+        log.exception("STARTUP CHECK FAILED")
+        await app.stop()
+        raise
 
-    log.info("====================================")
-    log.info("Bot started")
-    await asyncio.Event().wait()
+    log.info("Command handlers: READY")
+    log.info("Bot is waiting for Telegram messages")
+
+    await idle()
+
+    await app.stop()
+    mongo.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
