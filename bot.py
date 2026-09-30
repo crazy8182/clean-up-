@@ -245,27 +245,63 @@ async def start_health_server():
     await site.start()
     log.info("Health server listening on 0.0.0.0:%s", port)
 
-@app.on_message(filters.command("start") & filters.private)
-@app.on_message(filters.command("ping"))
-async def ping_cmd(client, message):
-    await message.reply_text("🏓 Bot is working!\n\nTelegram connection: ✅\nKoyeb service: ✅")
+@app.on_message(filters.private & filters.text)
+async def command_router(client, message):
+    """Robust private command router with explicit logging."""
+    text = (message.text or "").strip()
+    if not text:
+        return
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.reply_text("⛔ Admin only.")
-    await message.reply_text(
-        "🎬 Movie Cleanup Bot\n\n"
-        "/index - index channel\n"
-        "/delete Movie/Series - preview one title\n"
-        "/confirm_delete Movie/Series - execute one-title cleanup\n"
-        "/deleteall - scan complete database and preview cleanup\n"
-        "/confirm_deleteall - execute complete cleanup\n\n"
-        "Series keep one best 480p + 720p + 1080p per episode.\n"
-        "Combined/Complete/Batch/Multi-Episode files are protected."
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "Incoming private message: user_id=%s username=%s text=%r",
+        user_id,
+        message.from_user.username if message.from_user else None,
+        text[:200],
     )
 
-@app.on_message(filters.command("index") & filters.private)
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@", 1)[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    if command == "/ping":
+        await message.reply_text(
+            "🏓 Bot is working!\\n\\n"
+            "Telegram connection: ✅\\n"
+            "Koyeb service: ✅"
+        )
+        return
+
+    if command == "/start":
+        if user_id not in ADMIN_IDS:
+            await message.reply_text(
+                f"⛔ Admin only.\\nYour Telegram ID: `{user_id}`"
+            )
+            return
+        await message.reply_text(
+            "🎬 Movie Cleanup Bot\\n\\n"
+            "/ping - connection test\\n"
+            "/index - index channel\\n"
+            "/delete Movie/Series - preview one title\\n"
+            "/confirm_delete Movie/Series - execute one-title cleanup\\n"
+            "/deleteall - scan complete database and preview cleanup\\n"
+            "/confirm_deleteall - execute complete cleanup"
+        )
+        return
+
+    # Dispatch to the existing functions. They are defined before the first
+    # Telegram update can normally arrive because app.start() is called in main.
+    if command == "/index":
+        return await index_cmd(client, message)
+    if command == "/delete":
+        return await delete_cmd(client, message)
+    if command == "/confirm_delete":
+        return await confirm_delete_cmd(client, message)
+    if command == "/deleteall":
+        return await deleteall_cmd(client, message)
+    if command == "/confirm_deleteall":
+        return await confirm_deleteall_cmd(client, message)
+
 async def index_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
@@ -340,7 +376,6 @@ async def run_deletion(client, docs, progress):
 
     return deleted, failed
 
-@app.on_message(filters.command("deleteall") & filters.private)
 async def deleteall_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
@@ -382,7 +417,6 @@ async def deleteall_cmd(client, message):
     )
     await status.edit_text(text)
 
-@app.on_message(filters.command("confirm_deleteall") & filters.private)
 async def confirm_deleteall_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
@@ -414,7 +448,6 @@ async def confirm_deleteall_cmd(client, message):
         f"Remaining indexed files: {len(keep) + failed}"
     )
 
-@app.on_message(filters.command("delete") & filters.private)
 async def delete_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")
@@ -444,7 +477,6 @@ async def delete_cmd(client, message):
     )
     await message.reply_text(text)
 
-@app.on_message(filters.command("confirm_delete") & filters.private)
 async def confirm_delete_cmd(client, message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply_text("⛔ Admin only.")

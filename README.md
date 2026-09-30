@@ -90,3 +90,7 @@ The bot calls `load_dotenv()` before reading configuration, so a `.env` file pre
 On startup the logs show the connected Telegram bot username without exposing the token. Test `/ping` to verify Telegram updates.
 
 Do not publish real Telegram/MongoDB secrets in a public GitHub repository. Prefer Koyeb environment variables; if a secret has already been exposed publicly, rotate it.
+
+
+## v4 Telegram command fix
+Commands are handled by a single private-text router with explicit logging. This avoids duplicate command-filter handlers and accepts `/start`, `/ping`, `/index`, `/delete`, `/deleteall` and confirmation commands including `/command@botusername` forms.
