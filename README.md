@@ -35,3 +35,12 @@ Telegram message is deleted first. MongoDB record is deleted only after successf
 Series:
 Individual S01E01/S01E02 files keep one best 480p, 720p and 1080p.
 Combined/Complete/Completed/Full Season/Season Pack/Batch/Multi-Episode/range files are protected and one best copy per quality is retained.
+
+
+## Restart notification
+
+After every successful process start/restart, the bot sends all configured `ADMIN_IDS`:
+
+♻️ Bot Restarted Successfully
+
+This is sent only after Telegram and MongoDB startup checks have completed.

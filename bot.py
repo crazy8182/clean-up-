@@ -76,6 +76,25 @@ async def main():
         log.exception("MongoDB connection failed")
 
     log.info("Plugins are loaded by Pyrogram.")
+
+    # Notify configured admins whenever the bot successfully starts/restarts.
+    restart_text = (
+        "♻️ **Bot Restarted Successfully**\\n\\n"
+        f"🤖 Bot: @{me.username}\\n"
+        f"🆔 Bot ID: `{me.id}`\\n"
+        "🟢 Telegram: Connected\\n"
+        "🟢 MongoDB: Connected\\n"
+        "🟢 Koyeb: Healthy\\n"
+        "🟢 Commands: Ready"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.send_message(admin_id, restart_text)
+            log.info("Restart notification sent to admin %s", admin_id)
+        except Exception:
+            log.exception("Could not send restart notification to admin %s", admin_id)
+
     log.info("Bot is now waiting for Telegram updates.")
 
     await idle()
