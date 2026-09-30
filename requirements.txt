@@ -1,0 +1,5 @@
+pyrogram>=2.0,<3.0
+tgcrypto>=1.2.5
+motor>=3.6
+pymongo>=4.9
+aiohttp>=3.10
